@@ -41,12 +41,11 @@ bot = telegram.Bot(
 )
 
 # Hàm lấy dữ liệu từ Binance
-async def get_crypto_data():
+async def get_binance_data():
     try:
         session = requests.Session()
-        retries = Retry(total=5, backoff_factor=3, status_forcelist=[429, 500, 502, 503, 504])
+        retries = Retry(total=5, backoff_factor=3, status_forcelist=[429, 451, 500, 502, 503, 504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
-        result = {}
         
         coin = 'bitcoin'
         url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=21"
@@ -55,8 +54,8 @@ async def get_crypto_data():
         data = response.json()
         
         if not data or isinstance(data, dict):
-            logging.error(f"Invalid response for {coin}: {data}")
-            return None, f"Invalid response for {coin}"
+            logging.error(f"Invalid Binance response for {coin}: {data}")
+            return None, f"Invalid Binance response for {coin}"
         
         df = pd.DataFrame(data, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -64,21 +63,82 @@ async def get_crypto_data():
             'taker_buy_quote', 'ignored'
         ])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df['volume'] = df['volume'].astype(float)  # Khối lượng giao dịch
-        df['close'] = df['close'].astype(float)   # Giá đóng cửa
-        result[coin] = df[['timestamp', 'volume', 'close']]
+        df['volume'] = df['volume'].astype(float)
+        df['close'] = df['close'].astype(float)
         
-        logging.info(f"API response for {coin}: {data[:2]}")
-        return result, None
+        logging.info(f"Binance API response for {coin}: {data[:2]}")
+        return df[['timestamp', 'volume', 'close']], None
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 451:
+            logging.error("Binance API: 451 Client Error - Access restricted.")
+            return None, "Binance API: 451 Client Error - Access restricted."
+        elif e.response.status_code == 429:
+            logging.error("Binance API: Rate limit exceeded.")
+            return None, "Binance API: Rate limit exceeded."
+        logging.error(f"Binance API: HTTP error: {str(e)}")
+        return None, f"Binance API: HTTP error: {str(e)}"
+    except Exception as e:
+        logging.error(f"Binance API: Error fetching data: {str(e)}")
+        return None, f"Binance API: Error fetching data: {str(e)}"
+
+# Hàm lấy dữ liệu từ CryptoCompare (dự phòng)
+async def get_cryptocompare_data():
+    try:
+        session = requests.Session()
+        retries = Retry(total=5, backoff_factor=3, status_forcelist=[429, 500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+        
+        coin, symbol = 'bitcoin', 'BTC'
+        url = f"https://min-api.cryptocompare.com/data/histominute?fsym={symbol}&tsym=USD&limit=315&aggregate=15"
+        response = session.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('Response') != 'Success' or 'Data' not in data:
+            logging.error(f"Invalid CryptoCompare response for {coin}: {data}")
+            return None, f"Invalid CryptoCompare response for {coin}"
+        
+        df = pd.DataFrame(data['Data'])
+        if 'time' not in df.columns or df.empty:
+            logging.error(f"Invalid CryptoCompare data for {coin}: {data['Data'][:2]}")
+            return None, f"Invalid CryptoCompare data for {coin}"
+        
+        logging.info(f"CryptoCompare API response for {coin}: {data['Data'][:2]}")
+        df['timestamp'] = pd.to_datetime(df['time'], unit='s')
+        df['volume'] = df['volumeto'].astype(float)
+        df['close'] = df['close'].astype(float)
+        
+        return df[['timestamp', 'volume', 'close']], None
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 429:
-            logging.error("Rate limit exceeded for Binance API.")
-            return None, "Rate limit exceeded. Please try again later."
-        logging.error(f"HTTP error fetching data: {str(e)}")
-        return None, str(e)
+            logging.error("CryptoCompare API: Rate limit exceeded.")
+            return None, "CryptoCompare API: Rate limit exceeded."
+        logging.error(f"CryptoCompare API: HTTP error: {str(e)}")
+        return None, f"CryptoCompare API: HTTP error: {str(e)}"
     except Exception as e:
-        logging.error(f"Error fetching data: {str(e)}")
-        return None, str(e)
+        logging.error(f"CryptoCompare API: Error fetching data: {str(e)}")
+        return None, f"CryptoCompare API: Error fetching data: {str(e)}"
+
+# Hàm lấy dữ liệu (thử Binance trước, dự phòng CryptoCompare)
+async def get_crypto_data():
+    coin = 'bitcoin'
+    result = {}
+    
+    # Thử Binance trước
+    df, error = await get_binance_data()
+    if df is not None:
+        result[coin] = df
+        return result, None
+    
+    # Nếu Binance thất bại, thử CryptoCompare
+    logging.warning(f"Binance failed: {error}. Falling back to CryptoCompare.")
+    await send_notification(f"Error: {error}. Switching to CryptoCompare.")
+    df, error = await get_cryptocompare_data()
+    if df is not None:
+        result[coin] = df
+        return result, None
+    
+    return None, f"Failed to fetch data from both Binance and CryptoCompare: {error}"
 
 # Hàm lưu dữ liệu vào CSV
 async def save_to_csv(df, coin, volume_15m, ma20_volume, volume_ratio_percent, price, price_change_percent):
@@ -159,10 +219,10 @@ async def run_bot():
     data, fetch_error = await get_crypto_data()
     
     if fetch_error:
-        await send_notification(f"Error: Failed to fetch data: {fetch_error}")
-        if "Rate limit exceeded" in fetch_error:
-            logging.info("Pausing for 300 seconds due to rate limit...")
-            await asyncio.sleep(300)  # Tạm dừng 5 phút nếu vượt rate limit
+        await send_notification(f"Error: {fetch_error}")
+        if "Rate limit exceeded" in fetch_error or "451 Client Error" in fetch_error:
+            logging.info("Pausing for 600 seconds due to rate limit or access restriction...")
+            await asyncio.sleep(600)  # Tạm dừng 10 phút nếu lỗi rate limit hoặc 451
         return
     
     coin = 'bitcoin'
